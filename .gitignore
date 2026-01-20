@@ -217,3 +217,15 @@ runs/
 *.pt
 *.onnx
 *.engine
+artifacts/
+runs/
+*.pt
+*.onnx
+*.engine
+
+
+# Never commit Codex creds
+.codex/
+**/.codex/
+auth.json
+**/auth.json
