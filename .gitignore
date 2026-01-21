@@ -223,6 +223,16 @@ runs/
 *.onnx
 *.engine
 
+# datasets / outputs / caches
+data/
+datasets/
+runs/
+artifacts/*.npz
+artifacts/*.csv
+artifacts/*.json
+__pycache__/
+.pytest_cache/
+
 
 # Never commit Codex creds
 .codex/

@@ -342,7 +342,7 @@ def main():
 
             with torch.no_grad():
                 if args.fp16 and device.type == "cuda":
-                    with torch.cuda.amp.autocast(device_type="cuda", dtype=torch.float16):
+                    with torch.cuda.amp.autocast(dtype=torch.float16):
                         feats = embedder(batch_tensors)
                 else:
                     feats = embedder(batch_tensors)
