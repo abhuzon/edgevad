@@ -3,7 +3,8 @@ import logging
 import numpy as np
 import torch
 
-from scripts.score_avenue import (
+from edgevad.scripts.score_avenue import (
+    score_dataset,
     set_seed,
     smooth_moving_average,
     validate_metrics_schema,
@@ -61,3 +62,50 @@ def test_validate_metrics_schema_required_keys():
         pass
     else:
         raise AssertionError("validate_metrics_schema should raise on missing keys")
+
+
+def test_score_dataset_uses_gt_and_produces_metrics(monkeypatch):
+    # Minimal dataset with two frames and GT spanning both classes.
+    fake_samples = [
+        {"video": "v1.avi", "frame_idx": 0, "gt": 0, "image": np.zeros((2, 2, 3), dtype=np.uint8)},
+        {"video": "v1.avi", "frame_idx": 1, "gt": 1, "image": np.zeros((2, 2, 3), dtype=np.uint8)},
+    ]
+
+    class FakeDataset(list):
+        pass
+
+    class FakeYOLO:
+        def predict(self, **kwargs):
+            class Pred:
+                boxes = []
+
+            return [Pred()]
+
+    class FakeEmbedder:
+        def __call__(self, x):
+            return x
+
+    bank = torch.zeros((1, 1))
+    results = score_dataset(
+        dataset=FakeDataset(fake_samples),
+        yolo=FakeYOLO(),
+        embedder=FakeEmbedder(),
+        bank=bank,
+        device=torch.device("cpu"),
+        imgsz=640,
+        conf=0.25,
+        classes=None,
+        max_dets_per_frame=3,
+        fp16=False,
+        smooth=1,
+        max_frames=0,
+        logger=logging.getLogger("test_score_dataset"),
+    )
+
+    assert len(results) == 1
+    vr = results[0]
+    assert vr.video == "v1.avi"
+    assert vr.gt == [0, 1]
+    # With one positive and one negative, AUC/AP should be computed (not None).
+    assert vr.auc_raw is not None
+    assert vr.ap_raw is not None

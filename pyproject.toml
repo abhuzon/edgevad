@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edgevad"
+version = "0.1.0"
+description = "EdgeVAD anomaly detection utilities and scripts"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "EdgeVAD Contributors" },
+]
+dependencies = [
+  "numpy",
+  "opencv-python",
+  "psutil",
+  "scikit-learn",
+  "scipy",
+  "torch",
+  "torchvision",
+  "tqdm",
+  "ultralytics",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[tool.setuptools]
+package-dir = { "" = "edgevad" }
+
+[tool.setuptools.packages.find]
+where = ["edgevad"]
+include = ["edgevad", "edgevad.*"]

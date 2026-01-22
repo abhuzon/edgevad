@@ -18,11 +18,10 @@ Notes:
   For fully offline reproducibility, pass --embedder_weights PATH.
 """
 
-import os
+import argparse
+import json
 import sys
 import time
-import json
-import argparse
 from pathlib import Path
 
 import cv2
@@ -33,6 +32,8 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from ultralytics import YOLO
+
+from edgevad.data import AvenueVideoDataset, list_videos
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -227,21 +228,34 @@ def main():
     )
     preprocess = build_preprocess()
 
-    # Videos + shard
-    video_paths = sorted([p for p in train_dir.glob("*.avi")])
-    if len(video_paths) == 0:
-        raise RuntimeError(f"No .avi videos found under: {train_dir}")
-
+    # Videos + shard (deterministic ordering)
+    all_videos = list_videos(str(train_dir), ext=".avi")
     if not (0 <= args.shard_id < args.num_shards):
         raise ValueError("Invalid shard_id/num_shards")
-
-    video_paths = video_paths[args.shard_id :: args.num_shards]
+    video_paths = all_videos[args.shard_id :: args.num_shards]
+    if len(video_paths) == 0:
+        raise RuntimeError(f"No .avi videos found under: {train_dir} for shard {args.shard_id}")
 
     print(
         f"[INFO] shard {args.shard_id}/{args.num_shards} videos={len(video_paths)} frame_stride={args.frame_stride} max_embeddings={args.max_embeddings}"
     )
     print(
         f"[INFO] device={device} fp16={bool(args.fp16)} save_fp16={bool(args.save_fp16)} embedder_dim=576"
+    )
+
+    # Dataset driving frame sampling (BGR frames, identity transform)
+    dataset = AvenueVideoDataset(
+        video_dir=str(train_dir),
+        gt_dir=None,
+        split="train",
+        frame_stride=args.frame_stride,
+        max_frames=None,
+        start_offset=0,
+        seed=args.seed,
+        deterministic=True,
+        return_rgb=False,
+        transform=lambda x: x,
+        video_paths=video_paths,
     )
 
     embs = []
@@ -254,114 +268,102 @@ def main():
     total_frames_proc = 0
     total_boxes = 0
 
-    for vp in tqdm(video_paths, desc=f"videos(shard={args.shard_id})"):
-        cap = cv2.VideoCapture(str(vp))
-        if not cap.isOpened():
-            print(f"[WARN] Could not open video: {vp}", file=sys.stderr)
-            continue
+    for sample in tqdm(dataset, desc=f"frames(shard={args.shard_id})"):
+        frame = sample["image"]  # BGR frame (transform is identity)
+        video_name = sample["video"]
+        frame_idx = sample["frame_idx"]
+        total_frames_seen += 1
+        total_frames_proc += 1
 
-        frame_idx = -1
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frame_idx += 1
-            total_frames_seen += 1
+        H, W = frame.shape[:2]
 
-            if args.frame_stride > 1 and (frame_idx % args.frame_stride) != 0:
-                continue
-
-            total_frames_proc += 1
-            H, W = frame.shape[:2]
-
-            with torch.no_grad():
-                results = det.predict(
-                    source=frame,
-                    imgsz=args.imgsz,
-                    conf=args.conf,
-                    classes=classes,
-                    device=str(device),
-                    verbose=False,
-                )
-
-            r0 = results[0]
-            if r0.boxes is None or len(r0.boxes) == 0:
-                continue
-
-            boxes = r0.boxes
-            xyxy = boxes.xyxy.detach().cpu().numpy()
-            confs = (
-                boxes.conf.detach().cpu().numpy()
-                if boxes.conf is not None
-                else np.ones((xyxy.shape[0],), dtype=np.float32)
+        with torch.no_grad():
+            results = det.predict(
+                source=frame,
+                imgsz=args.imgsz,
+                conf=args.conf,
+                classes=classes,
+                device=str(device),
+                verbose=False,
             )
 
-            order = np.argsort(-confs)
-            xyxy = xyxy[order]
-            confs = confs[order]
+        r0 = results[0]
+        if r0.boxes is None or len(r0.boxes) == 0:
+            if len(embs) >= args.max_embeddings:
+                break
+            continue
 
-            crops = []
-            crop_meta = []
-            kept = 0
-            for i in range(xyxy.shape[0]):
-                if kept >= args.max_dets_per_frame:
-                    break
+        boxes = r0.boxes
+        xyxy = boxes.xyxy.detach().cpu().numpy()
+        confs = (
+            boxes.conf.detach().cpu().numpy()
+            if boxes.conf is not None
+            else np.ones((xyxy.shape[0],), dtype=np.float32)
+        )
 
-                x1, y1, x2, y2 = xyxy[i].tolist()
+        order = np.argsort(-confs)
+        xyxy = xyxy[order]
+        confs = confs[order]
 
-                # Expand box
-                cx = 0.5 * (x1 + x2)
-                cy = 0.5 * (y1 + y2)
-                bw = (x2 - x1) * args.expand
-                bh = (y2 - y1) * args.expand
-                x1e = cx - 0.5 * bw
-                y1e = cy - 0.5 * bh
-                x2e = cx + 0.5 * bw
-                y2e = cy + 0.5 * bh
+        crops = []
+        crop_meta = []
+        kept = 0
+        for i in range(xyxy.shape[0]):
+            if kept >= args.max_dets_per_frame:
+                break
 
-                x1i, y1i, x2i, y2i = clip_xyxy((x1e, y1e, x2e, y2e), W, H)
-                area = float((x2i - x1i) * (y2i - y1i))
-                if area < args.min_box_area:
-                    continue
+            x1, y1, x2, y2 = xyxy[i].tolist()
 
-                crop = frame[y1i:y2i, x1i:x2i]
-                if crop.size == 0:
-                    continue
+            # Expand box
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+            bw = (x2 - x1) * args.expand
+            bh = (y2 - y1) * args.expand
+            x1e = cx - 0.5 * bw
+            y1e = cy - 0.5 * bh
+            x2e = cx + 0.5 * bw
+            y2e = cy + 0.5 * bh
 
-                crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                crops.append(crop_rgb)
-                crop_meta.append((vp.name, frame_idx, (x1i, y1i, x2i, y2i)))
-                kept += 1
-
-            if len(crops) == 0:
+            x1i, y1i, x2i, y2i = clip_xyxy((x1e, y1e, x2e, y2e), W, H)
+            area = float((x2i - x1i) * (y2i - y1i))
+            if area < args.min_box_area:
                 continue
 
-            # Batch preprocess/embed
-            batch_tensors = torch.stack([preprocess(c) for c in crops], dim=0).to(device)
-            total_boxes += len(crops)
+            crop = frame[y1i:y2i, x1i:x2i]
+            if crop.size == 0:
+                continue
 
-            with torch.no_grad():
-                if args.fp16 and device.type == "cuda":
-                    with torch.cuda.amp.autocast(dtype=torch.float16):
-                        feats = embedder(batch_tensors)
-                else:
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            crops.append(crop_rgb)
+            crop_meta.append((video_name, frame_idx, (x1i, y1i, x2i, y2i)))
+            kept += 1
+
+        if len(crops) == 0:
+            if len(embs) >= args.max_embeddings:
+                break
+            continue
+
+        # Batch preprocess/embed
+        batch_tensors = torch.stack([preprocess(c) for c in crops], dim=0).to(device)
+        total_boxes += len(crops)
+
+        with torch.no_grad():
+            if args.fp16 and device.type == "cuda":
+                with torch.cuda.amp.autocast(dtype=torch.float16):
                     feats = embedder(batch_tensors)
+            else:
+                feats = embedder(batch_tensors)
 
-            feats = feats.detach().cpu().numpy()  # [B, D]
+        feats = feats.detach().cpu().numpy()  # [B, D]
 
-            for j in range(feats.shape[0]):
-                embs.append(feats[j])
-                meta_video.append(crop_meta[j][0])
-                meta_frame.append(crop_meta[j][1])
-                meta_xyxy.append(crop_meta[j][2])
-
-                if len(embs) >= args.max_embeddings:
-                    break
+        for j in range(feats.shape[0]):
+            embs.append(feats[j])
+            meta_video.append(crop_meta[j][0])
+            meta_frame.append(crop_meta[j][1])
+            meta_xyxy.append(crop_meta[j][2])
 
             if len(embs) >= args.max_embeddings:
                 break
-
-        cap.release()
 
         if len(embs) >= args.max_embeddings:
             break
