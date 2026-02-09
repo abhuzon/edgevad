@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
-"""EdgeVAD - Build a person-crop embedding memory bank from Avenue training videos.
+"""EdgeVAD - Build a person-crop embedding memory bank from training videos.
 
 What it does:
-- Loads a YOLO detector (your YOLO26 weights).
+- Loads a YOLO detector.
 - Iterates training_videos/*.avi.
 - Every --frame_stride frames: detect persons -> crop -> embed -> store vector.
+- Optionally applies coreset farthest-point selection to reduce bank size.
 - Saves NPZ (embeddings + minimal metadata).
 
 Multi-GPU (simple + robust): run 2 processes with sharding:
   --shard_id 0 --num_shards 2  (GPU0)
   --shard_id 1 --num_shards 2  (GPU1)
 Then merge NPZ files.
-
-Notes:
-- Embedder is MobileNetV3-Small feature extractor (D=576).
-- If --pretrained is used, torchvision may try to fetch weights (network dependent).
-  For fully offline reproducibility, pass --embedder_weights PATH.
 """
 
 import argparse
@@ -24,39 +20,21 @@ import sys
 import time
 from pathlib import Path
 
-import cv2
 import numpy as np
 import torch
-import torchvision
-from torchvision import transforms
 from tqdm import tqdm
 
 from ultralytics import YOLO
 
 from edgevad.data import AvenueVideoDataset, list_videos
-
-
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
-
-
-def set_seeds(seed: int) -> None:
-    import random
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def parse_classes(s: str):
-    s = (s or "").strip()
-    if s == "" or s.lower() == "none":
-        return None
-    parts = [p.strip() for p in s.split(",") if p.strip() != ""]
-    return [int(p) for p in parts]
+from edgevad.core import (
+    get_embedder,
+    preprocess_crops_to_tensor,
+    set_seed,
+    parse_classes,
+    extract_scene_id,
+)
+from edgevad.core.memory_bank import coreset_farthest_point
 
 
 def safe_mkdir(p: str) -> None:
@@ -76,64 +54,9 @@ def clip_xyxy(xyxy, W, H):
     return x1, y1, x2, y2
 
 
-class MobileNetV3SmallEmbedder(torch.nn.Module):
-    """Return pooled feature vector (D=576) from MobileNetV3-Small."""
-
-    def __init__(self, pretrained: bool = False, weights_path: str = ""):
-        super().__init__()
-
-        if weights_path:
-            backbone = torchvision.models.mobilenet_v3_small(weights=None)
-            sd = torch.load(weights_path, map_location="cpu")
-            if isinstance(sd, dict) and "state_dict" in sd:
-                sd = sd["state_dict"]
-            cleaned = {}
-            for k, v in sd.items():
-                nk = k[7:] if k.startswith("module.") else k
-                cleaned[nk] = v
-            missing, unexpected = backbone.load_state_dict(cleaned, strict=False)
-            if missing:
-                print(f"[WARN] Missing keys in embedder weights: {len(missing)}", file=sys.stderr)
-            if unexpected:
-                print(f"[WARN] Unexpected keys in embedder weights: {len(unexpected)}", file=sys.stderr)
-            self.backbone = backbone
-        else:
-            if pretrained:
-                try:
-                    weights = torchvision.models.MobileNet_V3_Small_Weights.DEFAULT
-                    self.backbone = torchvision.models.mobilenet_v3_small(weights=weights)
-                except Exception as e:
-                    print(f"[WARN] Could not load pretrained MobileNetV3 weights: {e}", file=sys.stderr)
-                    print("[WARN] Falling back to random init. Use --embedder_weights for offline reproducibility.", file=sys.stderr)
-                    self.backbone = torchvision.models.mobilenet_v3_small(weights=None)
-            else:
-                self.backbone = torchvision.models.mobilenet_v3_small(weights=None)
-
-        self.features = self.backbone.features
-        self.avgpool = self.backbone.avgpool
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        return x
-
-
-def build_preprocess():
-    return transforms.Compose(
-        [
-            transforms.ToPILImage(),
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ]
-    )
-
-
 def main():
     ap = argparse.ArgumentParser(
-        "EdgeVAD - build memory bank from Avenue training videos (person crops)."
+        "EdgeVAD - build memory bank from training videos (person crops)."
     )
 
     ap.add_argument("--yolo", type=str, required=True, help="Path to YOLO weights (.pt).")
@@ -160,7 +83,7 @@ def main():
         "--min_box_area", type=float, default=20 * 20, help="Skip tiny boxes (px^2)."
     )
     ap.add_argument("--expand", type=float, default=1.05, help="Box expansion factor.")
-    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--batch_size", type=int, default=16, help="YOLO inference batch size (frames per batch). Higher = faster but more VRAM.")
     ap.add_argument(
         "--device", type=str, default="cuda", help="cuda / cpu / cuda:0 etc."
     )
@@ -183,6 +106,25 @@ def main():
         help="Local path to embedder weights for offline use.",
     )
 
+    # Coreset selection
+    ap.add_argument(
+        "--coreset_size",
+        type=int,
+        default=5000,
+        help="Coreset size for farthest-point selection. 0=no coreset, keep all.",
+    )
+    ap.add_argument(
+        "--per_scene",
+        action="store_true",
+        help="Apply coreset per-scene (ShanghaiTech). Each scene gets up to --coreset_size embeddings.",
+    )
+    ap.add_argument(
+        "--feature_mode",
+        choices=["mobilenet", "fpn"],
+        default="mobilenet",
+        help="Feature extraction: mobilenet (crop+embed) or fpn (YOLO FPN RoI-Align)",
+    )
+
     # Sharding (for multi-GPU via multi-process)
     ap.add_argument(
         "--shard_id",
@@ -199,7 +141,15 @@ def main():
 
     args = ap.parse_args()
 
-    set_seeds(args.seed)
+    # When --per_scene, disable the global embedding cap: per-scene coreset handles size reduction.
+    if args.per_scene:
+        args.max_embeddings = 0  # 0 = unlimited
+
+    if args.feature_mode == "fpn" and args.batch_size > 1:
+        print("[INFO] FPN mode requires batch_size=1, overriding.", file=sys.stderr)
+        args.batch_size = 1
+
+    set_seed(args.seed, deterministic=True)
 
     train_dir = Path(args.train_dir)
     if not train_dir.exists():
@@ -218,15 +168,14 @@ def main():
     det = YOLO(args.yolo)
     classes = parse_classes(args.classes)
 
-    # Embedder
-    embedder = (
-        MobileNetV3SmallEmbedder(
-            pretrained=args.pretrained, weights_path=args.embedder_weights
-        )
-        .to(device)
-        .eval()
+    # Embedder (unified factory)
+    embedder = get_embedder(
+        feature_mode=args.feature_mode,
+        yolo_model=det if args.feature_mode == "fpn" else None,
+        device=device,
+        pretrained=args.pretrained,
+        weights_path=args.embedder_weights,
     )
-    preprocess = build_preprocess()
 
     # Videos + shard (deterministic ordering)
     all_videos = list_videos(str(train_dir), ext=".avi")
@@ -240,7 +189,7 @@ def main():
         f"[INFO] shard {args.shard_id}/{args.num_shards} videos={len(video_paths)} frame_stride={args.frame_stride} max_embeddings={args.max_embeddings}"
     )
     print(
-        f"[INFO] device={device} fp16={bool(args.fp16)} save_fp16={bool(args.save_fp16)} embedder_dim=576"
+        f"[INFO] device={device} fp16={bool(args.fp16)} save_fp16={bool(args.save_fp16)} embedder_dim=576 coreset_size={args.coreset_size} feature_mode={args.feature_mode}"
     )
 
     # Dataset driving frame sampling (BGR frames, identity transform)
@@ -268,18 +217,21 @@ def main():
     total_frames_proc = 0
     total_boxes = 0
 
-    for sample in tqdm(dataset, desc=f"frames(shard={args.shard_id})"):
-        frame = sample["image"]  # BGR frame (transform is identity)
-        video_name = sample["video"]
-        frame_idx = sample["frame_idx"]
-        total_frames_seen += 1
-        total_frames_proc += 1
+    # Batching state
+    frame_batch = []
+    frame_batch_meta = []  # (video_name, frame_idx, H, W)
 
-        H, W = frame.shape[:2]
+    def process_yolo_batch():
+        """Process accumulated batch of frames through YOLO."""
+        nonlocal total_boxes, total_frames_proc
 
+        if len(frame_batch) == 0:
+            return
+
+        # Run YOLO on batch
         with torch.no_grad():
             results = det.predict(
-                source=frame,
+                source=frame_batch,  # List of frames
                 imgsz=args.imgsz,
                 conf=args.conf,
                 classes=classes,
@@ -287,86 +239,120 @@ def main():
                 verbose=False,
             )
 
-        r0 = results[0]
-        if r0.boxes is None or len(r0.boxes) == 0:
-            if len(embs) >= args.max_embeddings:
-                break
-            continue
+        # Process each result
+        for frame, (video_name, frame_idx, H, W), result in zip(frame_batch, frame_batch_meta, results):
+            total_frames_proc += 1
 
-        boxes = r0.boxes
-        xyxy = boxes.xyxy.detach().cpu().numpy()
-        confs = (
-            boxes.conf.detach().cpu().numpy()
-            if boxes.conf is not None
-            else np.ones((xyxy.shape[0],), dtype=np.float32)
-        )
-
-        order = np.argsort(-confs)
-        xyxy = xyxy[order]
-        confs = confs[order]
-
-        crops = []
-        crop_meta = []
-        kept = 0
-        for i in range(xyxy.shape[0]):
-            if kept >= args.max_dets_per_frame:
-                break
-
-            x1, y1, x2, y2 = xyxy[i].tolist()
-
-            # Expand box
-            cx = 0.5 * (x1 + x2)
-            cy = 0.5 * (y1 + y2)
-            bw = (x2 - x1) * args.expand
-            bh = (y2 - y1) * args.expand
-            x1e = cx - 0.5 * bw
-            y1e = cy - 0.5 * bh
-            x2e = cx + 0.5 * bw
-            y2e = cy + 0.5 * bh
-
-            x1i, y1i, x2i, y2i = clip_xyxy((x1e, y1e, x2e, y2e), W, H)
-            area = float((x2i - x1i) * (y2i - y1i))
-            if area < args.min_box_area:
+            if result.boxes is None or len(result.boxes) == 0:
                 continue
 
-            crop = frame[y1i:y2i, x1i:x2i]
-            if crop.size == 0:
+            boxes = result.boxes
+            xyxy = boxes.xyxy.detach().cpu().numpy()
+            confs = (
+                boxes.conf.detach().cpu().numpy()
+                if boxes.conf is not None
+                else np.ones((xyxy.shape[0],), dtype=np.float32)
+            )
+
+            order = np.argsort(-confs)
+            xyxy = xyxy[order]
+            confs = confs[order]
+
+            crops = []
+            crop_meta = []
+            kept = 0
+            for i in range(xyxy.shape[0]):
+                if kept >= args.max_dets_per_frame:
+                    break
+
+                x1, y1, x2, y2 = xyxy[i].tolist()
+
+                # Expand box
+                cx = 0.5 * (x1 + x2)
+                cy = 0.5 * (y1 + y2)
+                bw = (x2 - x1) * args.expand
+                bh = (y2 - y1) * args.expand
+                x1e = cx - 0.5 * bw
+                y1e = cy - 0.5 * bh
+                x2e = cx + 0.5 * bw
+                y2e = cy + 0.5 * bh
+
+                x1i, y1i, x2i, y2i = clip_xyxy((x1e, y1e, x2e, y2e), W, H)
+                area = float((x2i - x1i) * (y2i - y1i))
+                if area < args.min_box_area:
+                    continue
+
+                if args.feature_mode == "mobilenet":
+                    crop = frame[y1i:y2i, x1i:x2i]
+                    if crop.size == 0:
+                        continue
+                    crops.append(crop.copy())
+                crop_meta.append((video_name, frame_idx, (x1i, y1i, x2i, y2i)))
+                kept += 1
+
+            if len(crop_meta) == 0:
                 continue
 
-            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            crops.append(crop_rgb)
-            crop_meta.append((video_name, frame_idx, (x1i, y1i, x2i, y2i)))
-            kept += 1
-
-        if len(crops) == 0:
-            if len(embs) >= args.max_embeddings:
-                break
-            continue
-
-        # Batch preprocess/embed
-        batch_tensors = torch.stack([preprocess(c) for c in crops], dim=0).to(device)
-        total_boxes += len(crops)
-
-        with torch.no_grad():
-            if args.fp16 and device.type == "cuda":
-                with torch.cuda.amp.autocast(dtype=torch.float16):
-                    feats = embedder(batch_tensors)
+            # Embed detections
+            if args.feature_mode == "fpn":
+                boxes_arr = np.array(
+                    [(x1, y1, x2, y2) for _, _, (x1, y1, x2, y2) in crop_meta],
+                    dtype=np.float64,
+                )
+                total_boxes += len(boxes_arr)
+                with torch.no_grad():
+                    feats = embedder(frame, boxes_arr, imgsz=args.imgsz)
+                feats = feats.detach().cpu().numpy()
             else:
-                feats = embedder(batch_tensors)
+                batch_tensors = preprocess_crops_to_tensor(crops, device=device, fp16=args.fp16)
+                total_boxes += len(crops)
+                with torch.no_grad():
+                    if args.fp16 and device.type == "cuda":
+                        with torch.cuda.amp.autocast(dtype=torch.float16):
+                            feats = embedder(batch_tensors)
+                    else:
+                        feats = embedder(batch_tensors)
+                feats = feats.detach().cpu().numpy()
 
-        feats = feats.detach().cpu().numpy()  # [B, D]
+            for j in range(feats.shape[0]):
+                embs.append(feats[j])
+                meta_video.append(crop_meta[j][0])
+                meta_frame.append(crop_meta[j][1])
+                meta_xyxy.append(crop_meta[j][2])
 
-        for j in range(feats.shape[0]):
-            embs.append(feats[j])
-            meta_video.append(crop_meta[j][0])
-            meta_frame.append(crop_meta[j][1])
-            meta_xyxy.append(crop_meta[j][2])
+                if args.max_embeddings > 0 and len(embs) >= args.max_embeddings:
+                    break
 
-            if len(embs) >= args.max_embeddings:
+            if args.max_embeddings > 0 and len(embs) >= args.max_embeddings:
                 break
 
-        if len(embs) >= args.max_embeddings:
-            break
+        # Clear batch
+        frame_batch.clear()
+        frame_batch_meta.clear()
+
+    for sample in tqdm(dataset, desc=f"frames(shard={args.shard_id})"):
+        frame = sample["image"]  # BGR frame (transform is identity)
+        video_name = sample["video"]
+        frame_idx = sample["frame_idx"]
+        total_frames_seen += 1
+
+        H, W = frame.shape[:2]
+
+        # Add to batch
+        frame_batch.append(frame)
+        frame_batch_meta.append((video_name, frame_idx, H, W))
+
+        # Process batch when full
+        if len(frame_batch) >= args.batch_size:
+            process_yolo_batch()
+
+            # Check if done
+            if args.max_embeddings > 0 and len(embs) >= args.max_embeddings:
+                break
+
+    # Process remaining frames in batch
+    if len(frame_batch) > 0:
+        process_yolo_batch()
 
     if len(embs) == 0:
         raise RuntimeError(
@@ -376,16 +362,57 @@ def main():
     emb_arr = np.stack(embs, axis=0)
     emb_arr = emb_arr.astype(np.float16 if args.save_fp16 else np.float32)
 
-    meta_frame = np.asarray(meta_frame, dtype=np.int32)
-    meta_xyxy = np.asarray(meta_xyxy, dtype=np.int32)
-    meta_video = np.asarray(meta_video, dtype=object)
+    meta_frame_arr = np.asarray(meta_frame, dtype=np.int32)
+    meta_xyxy_arr = np.asarray(meta_xyxy, dtype=np.int32)
+    meta_video_arr = np.asarray(meta_video, dtype=object)
+
+    # Derive scene IDs from video names
+    scene_ids = np.array(
+        [extract_scene_id(str(v)) or "unknown" for v in meta_video_arr],
+        dtype=object,
+    )
+
+    # Coreset selection
+    if args.coreset_size > 0 and emb_arr.shape[0] > args.coreset_size:
+        if args.per_scene:
+            unique_scenes = sorted(set(scene_ids.tolist()))
+            print(f"[INFO] Per-scene coreset: {len(unique_scenes)} scenes, up to {args.coreset_size} each")
+            all_indices = []
+            for sid in unique_scenes:
+                mask = scene_ids == sid
+                scene_orig_indices = np.where(mask)[0]
+                n_scene = int(mask.sum())
+                if n_scene > args.coreset_size:
+                    _, local_idx = coreset_farthest_point(emb_arr[mask], args.coreset_size, seed=args.seed)
+                    all_indices.append(scene_orig_indices[local_idx])
+                    print(f"[INFO]   scene={sid}: {n_scene} -> {args.coreset_size}")
+                else:
+                    all_indices.append(scene_orig_indices)
+                    print(f"[INFO]   scene={sid}: {n_scene} (kept all)")
+            idx = np.concatenate(all_indices)
+            idx.sort()
+            emb_arr = emb_arr[idx]
+            meta_frame_arr = meta_frame_arr[idx]
+            meta_xyxy_arr = meta_xyxy_arr[idx]
+            meta_video_arr = meta_video_arr[idx]
+            scene_ids = scene_ids[idx]
+            print(f"[INFO] Per-scene coreset done: {emb_arr.shape[0]} total embeddings")
+        else:
+            print(f"[INFO] Coreset selection: {emb_arr.shape[0]} -> {args.coreset_size}")
+            emb_arr, idx = coreset_farthest_point(emb_arr, args.coreset_size, seed=args.seed)
+            meta_frame_arr = meta_frame_arr[idx]
+            meta_xyxy_arr = meta_xyxy_arr[idx]
+            meta_video_arr = meta_video_arr[idx]
+            scene_ids = scene_ids[idx]
+            print(f"[INFO] Coreset done: {emb_arr.shape[0]} embeddings selected")
 
     np.savez_compressed(
         args.out,
         embeddings=emb_arr,
-        video=meta_video,
-        frame=meta_frame,
-        xyxy=meta_xyxy,
+        video=meta_video_arr,
+        frame=meta_frame_arr,
+        xyxy=meta_xyxy_arr,
+        scene_ids=scene_ids,
         config=json.dumps(vars(args), ensure_ascii=False),
     )
 
@@ -393,9 +420,10 @@ def main():
     print("\n=== Memory Bank Summary ===")
     print(f"out: {args.out}")
     print(f"embeddings: {emb_arr.shape} dtype={emb_arr.dtype}")
-    print(f"videos_used: {len(set(meta_video.tolist()))}")
+    print(f"videos_used: {len(set(meta_video_arr.tolist()))}")
     print(f"frames_seen: {total_frames_seen} frames_processed: {total_frames_proc}")
-    print(f"boxes_embedded: {len(embs)}")
+    print(f"boxes_embedded: {len(embs)} (before coreset)")
+    print(f"coreset_size: {emb_arr.shape[0]} (after coreset)")
     print(f"throughput: {total_frames_proc / max(dt, 1e-9):.2f} processed_frames/s")
     print(f"wall_time_s: {dt:.1f}")
 

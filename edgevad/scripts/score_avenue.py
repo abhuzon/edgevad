@@ -14,14 +14,10 @@ from __future__ import annotations
 
 import argparse
 import csv
-import datetime as _dt
 import json
-import logging
+import math
 import os
-import platform
-import random
 import re
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -46,134 +42,57 @@ except Exception as e:
     ultralytics = None
     _ultralytics_import_error = e
 
-try:
-    import torchvision
-    _torchvision_import_error: Optional[Exception] = None
-except Exception as e:
-    torchvision = None
-    _torchvision_import_error = e
-
-try:
-    from sklearn.metrics import roc_auc_score, average_precision_score
-except Exception:
-    roc_auc_score = None
-    average_precision_score = None
-
-
-# -------------------------
-# Logging / Repro
-# -------------------------
-
-def utc_ts() -> str:
-    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-
-def get_git_hash(repo_dir: str) -> Optional[str]:
-    try:
-        out = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_dir,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        if re.fullmatch(r"[0-9a-f]{40}", out):
-            return out
-    except Exception:
-        pass
-    return None
-
-
-def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
-    logger = logging.getLogger("score_avenue")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-
-    if log_file:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(log_file, mode="w", encoding="utf-8")
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
-
-    logger.propagate = False
-    return logger
-
-
-def set_seed(seed: int, deterministic: bool, logger: logging.Logger) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    if deterministic:
-        # Best-effort determinism (some ops may still be nondeterministic depending on kernels)
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        try:
-            torch.use_deterministic_algorithms(True)
-        except Exception as e:
-            logger.warning(f"torch.use_deterministic_algorithms(True) failed: {e}")
-
-
-def percentile(x: List[float], p: float) -> Optional[float]:
-    if not x:
-        return None
-    arr = np.asarray(x, dtype=np.float64)
-    return float(np.percentile(arr, p))
+# Shared core imports
+from edgevad.core import (
+    utc_ts, get_git_hash, setup_logger, env_info,
+    set_seed, percentile,
+    l2_normalize, sanitize_array,
+    compute_auc_ap, validate_metrics_schema,
+    smooth_moving_average, gaussian_smooth,
+    MobileNetV3SmallEmbedder, preprocess_crops_to_tensor, get_embedder,
+    load_memory_bank_npz,
+    parse_classes,
+)
+from edgevad.core.memory_bank import score_knn
 
 
 # -------------------------
-# GT Loader (FIXED)
+# GT Loader (Avenue-specific)
 # -------------------------
 
 def volLabel_to_frame_labels(vol):
     """
     Convert Avenue volLabel into per-frame binary labels:
       1 = abnormal frame, 0 = normal frame
-    vol can be:
-      - MATLAB cell array loaded by scipy -> dtype=object, shapes (1,T), (T,1), (T,)
-      - numeric array (H,W,T) or similar
     """
     vol = np.asarray(vol)
 
-    # Case 1: cell array => object array, each element is a 2D mask
     if vol.dtype == object:
-        cells = vol.ravel()  # works for (1,T), (T,1), (T,)
+        cells = vol.ravel()
         labels = np.zeros(len(cells), dtype=np.uint8)
         for i, cell in enumerate(cells):
             m = np.asarray(cell)
-            # if nested object, coerce again
             if m.dtype == object:
                 m = np.asarray(m.tolist())
             labels[i] = 1 if (m > 0).any() else 0
         return labels
 
-    # Case 2: numeric array
     if vol.ndim == 3:
-        # assume last axis is time: (H,W,T)
         T = vol.shape[-1]
         return ((vol.reshape(-1, T).sum(axis=0) > 0).astype(np.uint8))
     if vol.ndim == 2:
-        # ambiguous, but treat columns as time
         return ((vol.sum(axis=0) > 0).astype(np.uint8))
 
-    # fallback
     flat = vol.ravel()
     return ((flat > 0).astype(np.uint8))
 
 
 def label_path_for_video(gt_dir: str, video_path: str) -> Optional[str]:
-    stem = os.path.splitext(os.path.basename(video_path))[0]  # "01"
+    stem = os.path.splitext(os.path.basename(video_path))[0]
     m = re.search(r"(\d+)", stem)
     if not m:
         return None
-    vid = int(m.group(1))  # 1..21
+    vid = int(m.group(1))
     candidates = [
         os.path.join(gt_dir, f"{vid}_label.mat"),
         os.path.join(gt_dir, f"{vid:02d}_label.mat"),
@@ -188,15 +107,11 @@ def load_avenue_labels_for_video(gt_dir: str, video_path: str, total_frames: Opt
     lp = label_path_for_video(gt_dir, video_path)
     if lp is None:
         return None
-
-    # DO NOT squeeze and then index [0] incorrectly
     mat = sio.loadmat(lp)
     if "volLabel" not in mat:
         return None
-
-    labels = volLabel_to_frame_labels(mat["volLabel"])  # length = T
+    labels = volLabel_to_frame_labels(mat["volLabel"])
     if total_frames is not None:
-        # match video length safely
         if len(labels) < total_frames:
             labels = np.pad(labels, (0, total_frames - len(labels)), constant_values=0)
         elif len(labels) > total_frames:
@@ -205,99 +120,17 @@ def load_avenue_labels_for_video(gt_dir: str, video_path: str, total_frames: Opt
 
 
 # -------------------------
-# Model components
+# Data structures
 # -------------------------
-
-class MobileNetV3SmallEmbedder(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        if torchvision is None:
-            raise RuntimeError(f"Failed to import torchvision. Error: {_torchvision_import_error}")
-        weights = torchvision.models.MobileNet_V3_Small_Weights.DEFAULT
-        m = torchvision.models.mobilenet_v3_small(weights=weights)
-        self.features = m.features
-        self.avgpool = m.avgpool  # AdaptiveAvgPool2d(1)
-        self.out_dim = 576
-
-        # ImageNet normalization
-        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
-        self.register_buffer("_mean", mean, persistent=False)
-        self.register_buffer("_std", std, persistent=False)
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B,3,224,224) float in [0,1]
-        x = (x - self._mean) / self._std
-        x = self.features(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        return x
-
-
-def preprocess_crops_to_tensor(crops_bgr: List[np.ndarray], device: torch.device, fp16: bool) -> torch.Tensor:
-    # Convert BGR uint8 -> RGB float tensor (B,3,224,224)
-    batch = []
-    for c in crops_bgr:
-        if c is None or c.size == 0:
-            continue
-        r = cv2.resize(c, (224, 224), interpolation=cv2.INTER_LINEAR)
-        r = cv2.cvtColor(r, cv2.COLOR_BGR2RGB)
-        t = torch.from_numpy(r).to(torch.float32) / 255.0  # (H,W,C)
-        t = t.permute(2, 0, 1).contiguous()  # (C,H,W)
-        batch.append(t)
-    if not batch:
-        return torch.empty((0, 3, 224, 224), device=device, dtype=torch.float16 if fp16 else torch.float32)
-    x = torch.stack(batch, dim=0).to(device=device)
-    if fp16:
-        x = x.half()
-    return x
-
-
-def l2_normalize(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    return x / (x.norm(dim=1, keepdim=True) + eps)
-
-
-# -------------------------
-# Scoring / Metrics
-# -------------------------
-
-def smooth_moving_average(x: np.ndarray, win: int) -> np.ndarray:
-    if win <= 1:
-        return x.copy()
-    win = int(win)
-    kernel = np.ones(win, dtype=np.float32) / float(win)
-    # pad reflect for stable edges
-    pad = win // 2
-    xp = np.pad(x.astype(np.float32), (pad, pad), mode="reflect")
-    ys = np.convolve(xp, kernel, mode="valid")
-    return ys.astype(np.float32)
-
-
-def compute_auc_ap(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
-    # Requires both classes
-    if roc_auc_score is None or average_precision_score is None:
-        return None, None
-    y_true = y_true.astype(np.int32)
-    uniq = np.unique(y_true)
-    if len(uniq) < 2:
-        return None, None
-    try:
-        auc = float(roc_auc_score(y_true, y_score))
-        ap = float(average_precision_score(y_true, y_score))
-        return auc, ap
-    except Exception:
-        return None, None
-
 
 @dataclass
 class VideoResult:
     video: str
-    frame_idxs: List[int]          # ORIGINAL frame idx (0,3,6,...)
+    frame_idxs: List[int]
     scores: List[float]
     scores_smooth: List[float]
     num_dets: List[int]
-    gt: List[int]                  # 0/1 or -1
+    gt: List[int]
     wall_time_s: float
     proc_fps: float
     latency_ms: List[float]
@@ -308,11 +141,14 @@ class VideoResult:
     gt_counts: Dict[str, int]
 
 
+# -------------------------
+# Scoring
+# -------------------------
 
 def score_dataset(
     dataset: AvenueVideoDataset,
     yolo: Any,
-    embedder: MobileNetV3SmallEmbedder,
+    embedder: torch.nn.Module,
     bank: torch.Tensor,
     device: torch.device,
     imgsz: int,
@@ -322,7 +158,12 @@ def score_dataset(
     fp16: bool,
     smooth: int,
     max_frames: int,
-    logger: logging.Logger,
+    expand: float,
+    topk: int,
+    smooth_sigma: float,
+    min_box_area: float,
+    logger,
+    feature_mode: str = "mobilenet",
 ) -> List[VideoResult]:
     per_video: Dict[str, Dict[str, Any]] = {}
 
@@ -341,13 +182,14 @@ def score_dataset(
                 "latency_ms": [],
                 "t_start": time.time(),
                 "t_last": None,
+                "last_score": 0.5,
             },
         )
 
         if max_frames > 0 and len(vdata["frame_idxs"]) >= max_frames:
             continue
 
-        frame = sample["image"]  # BGR frame (transform is identity)
+        frame = sample["image"]
         t_frame0 = time.time()
 
         preds = yolo.predict(
@@ -362,33 +204,57 @@ def score_dataset(
         dets = []
         if boxes is not None and len(boxes) > 0:
             xyxy = boxes.xyxy.detach().cpu().numpy()
-            confs = boxes.conf.detach().cpu().numpy()
-            order = np.argsort(-confs)
+            confs_arr = boxes.conf.detach().cpu().numpy()
+            order = np.argsort(-confs_arr)
             for j in order[:max_dets_per_frame]:
                 x1, y1, x2, y2 = xyxy[j].tolist()
                 dets.append((x1, y1, x2, y2))
 
         crops = []
+        filtered_boxes = []
         h, w = frame.shape[:2]
         for (x1, y1, x2, y2) in dets:
-            x1i = max(0, min(w - 1, int(x1)))
-            y1i = max(0, min(h - 1, int(y1)))
-            x2i = max(0, min(w, int(x2)))
-            y2i = max(0, min(h, int(y2)))
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+            bw = (x2 - x1) * expand
+            bh = (y2 - y1) * expand
+            x1e = cx - 0.5 * bw
+            y1e = cy - 0.5 * bh
+            x2e = cx + 0.5 * bw
+            y2e = cy + 0.5 * bh
+            x1i = max(0, min(w - 1, int(x1e)))
+            y1i = max(0, min(h - 1, int(y1e)))
+            x2i = max(0, min(w, int(x2e)))
+            y2i = max(0, min(h, int(y2e)))
             if x2i <= x1i or y2i <= y1i:
                 continue
-            crops.append(frame[y1i:y2i, x1i:x2i].copy())
+            area = float((x2i - x1i) * (y2i - y1i))
+            if area < min_box_area:
+                continue
+            if feature_mode == "mobilenet":
+                crops.append(frame[y1i:y2i, x1i:x2i].copy())
+            filtered_boxes.append([x1i, y1i, x2i, y2i])
 
-        score = 0.0
-        nd = len(crops)
+        nd = len(filtered_boxes)
         if nd > 0:
-            x = preprocess_crops_to_tensor(crops, device=device, fp16=fp16)
             with torch.no_grad():
-                emb = embedder(x)
+                if feature_mode == "fpn":
+                    boxes_xyxy = np.array(filtered_boxes, dtype=np.float64)
+                    emb = embedder(frame, boxes_xyxy, imgsz=imgsz)
+                else:
+                    x = preprocess_crops_to_tensor(crops, device=device, fp16=fp16)
+                    emb = embedder(x)
                 emb = l2_normalize(emb.to(dtype=bank.dtype))
-                sim = emb @ bank.T
-                score = float(1.0 - sim.max().item())
+                per_det_scores = score_knn(emb, bank, topk=topk)
+                score = float(per_det_scores.max().item())
+        else:
+            score = vdata["last_score"]
 
+        if not math.isfinite(score):
+            logger.warning(f"{video} frame {frame_idx}: non-finite score -> carry-forward")
+            score = vdata["last_score"]
+
+        vdata["last_score"] = score
         vdata["frame_idxs"].append(frame_idx)
         vdata["scores"].append(score)
         vdata["num_dets"].append(nd)
@@ -398,16 +264,21 @@ def score_dataset(
 
     results: List[VideoResult] = []
     for video, data in per_video.items():
-        scores_np = np.asarray(data["scores"], dtype=np.float32)
-        scores_s = smooth_moving_average(scores_np, smooth).tolist()
+        scores_np = sanitize_array(data["scores"], f"{video}.scores_raw", logger)
+        if smooth_sigma > 0:
+            scores_s_arr = gaussian_smooth(scores_np, smooth_sigma)
+        else:
+            scores_s_arr = smooth_moving_average(scores_np, smooth)
+        scores_s = sanitize_array(scores_s_arr, f"{video}.scores_smooth", logger).tolist()
+
         gt_np = np.asarray(data["gt"], dtype=np.int32)
         valid = gt_np >= 0
         y_true = gt_np[valid].astype(np.int32)
         y_raw = scores_np[valid]
         y_smooth = np.asarray(scores_s, dtype=np.float32)[valid]
 
-        auc_raw, ap_raw = compute_auc_ap(y_true, y_raw)
-        auc_s, ap_s = compute_auc_ap(y_true, y_smooth)
+        auc_raw, ap_raw, _ = compute_auc_ap(y_true, y_raw)
+        auc_s, ap_s, _ = compute_auc_ap(y_true, y_smooth)
 
         gt_counts = {
             "-1": int((gt_np == -1).sum()),
@@ -415,7 +286,7 @@ def score_dataset(
             "1": int((gt_np == 1).sum()),
         }
         if gt_counts["1"] == 0 and gt_counts["0"] > 0 and gt_counts["-1"] == 0:
-            logger.warning(f"{video}: GT has 0 positives (all normal). If this happens for ALL videos, your GT parsing is wrong.")
+            logger.warning(f"{video}: GT has 0 positives (all normal).")
 
         t_start = data["t_start"]
         t_end = data["t_last"] if data["t_last"] is not None else t_start
@@ -426,7 +297,7 @@ def score_dataset(
             VideoResult(
                 video=video,
                 frame_idxs=data["frame_idxs"],
-                scores=data["scores"],
+                scores=scores_np.tolist(),
                 scores_smooth=scores_s,
                 num_dets=data["num_dets"],
                 gt=data["gt"],
@@ -443,75 +314,10 @@ def score_dataset(
 
     return results
 
-def parse_classes(s: str) -> Optional[List[int]]:
-    s = str(s).strip()
-    if s == "" or s.lower() in {"none", "null"}:
-        return None
-    # accepts: "0" or "0,1,2"
-    parts = [p.strip() for p in s.split(",")]
-    out = []
-    for p in parts:
-        if p == "":
-            continue
-        out.append(int(p))
-    return out if out else None
 
-
-def load_memory_bank_npz(path: str, device: torch.device, fp16: bool) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    d = np.load(path, allow_pickle=True)
-    if "embeddings" not in d:
-        raise RuntimeError(f"Memory bank npz missing 'embeddings': {path}")
-    E = d["embeddings"]
-    E = E.astype(np.float16 if fp16 else np.float32, copy=False)
-    meta = {}
-    if "config" in d:
-        try:
-            meta["config"] = str(d["config"])
-        except Exception:
-            meta["config"] = None
-    bank = torch.from_numpy(E).to(device=device)
-    bank = l2_normalize(bank)
-    return bank, meta
-
-
-def env_info(device: torch.device) -> Dict[str, Any]:
-    info: Dict[str, Any] = {}
-    info["python"] = sys.version.replace("\n", " ")
-    info["platform"] = platform.platform()
-    info["torch"] = torch.__version__
-    info["torchvision"] = getattr(torchvision, "__version__", None)
-    info["ultralytics"] = getattr(ultralytics, "__version__", None)
-    info["cuda_available"] = bool(torch.cuda.is_available())
-    info["cuda_version"] = getattr(torch.version, "cuda", None)
-    if torch.cuda.is_available() and "cuda" in str(device):
-        try:
-            idx = int(str(device).split(":")[-1])
-        except Exception:
-            idx = 0
-        info["gpu_name"] = torch.cuda.get_device_name(idx)
-    else:
-        info["gpu_name"] = None
-    return info
-
-
-def validate_metrics_schema(metrics: Dict[str, Any]) -> None:
-    required_top = {"timestamp_utc", "git_hash", "args", "env", "memory_bank", "overall", "runtime", "per_video"}
-    missing_top = required_top.difference(metrics.keys())
-    if missing_top:
-        raise ValueError(f"metrics_full missing top-level keys: {sorted(missing_top)}")
-
-    overall = metrics.get("overall", {})
-    for key in ("auc_raw", "auc_smooth", "ap_raw", "ap_smooth"):
-        if key not in overall:
-            raise ValueError(f"metrics_full.overall missing key: {key}")
-
-    runtime = metrics.get("runtime", {})
-    for key in ("wall_seconds", "proc_fps"):
-        if key not in runtime:
-            raise ValueError(f"metrics_full.runtime missing key: {key}")
-    if not isinstance(metrics.get("per_video"), list):
-        raise ValueError("metrics_full.per_video must be a list")
-
+# -------------------------
+# CLI + main
+# -------------------------
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -522,15 +328,21 @@ def main() -> None:
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--conf", type=float, default=0.25)
-    ap.add_argument("--classes", default="0", help="YOLO class ids, e.g. '0' for person. Empty disables filter.")
+    ap.add_argument("--classes", default="0", help="YOLO class ids, e.g. '0' for person.")
     ap.add_argument("--frame_stride", type=int, default=3)
     ap.add_argument("--max_dets_per_frame", type=int, default=3)
-    ap.add_argument("--batch_size", type=int, default=32)  # reserved (currently per-frame)
+    ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--smooth", type=int, default=9)
+    ap.add_argument("--expand", type=float, default=1.05, help="Box expansion factor (match build_memory_bank)")
     ap.add_argument("--max_frames", type=int, default=0, help="Max processed frames per video (0 = no limit)")
-    ap.add_argument("--demo_video", default="", help="Optional: run one video and also save scored demo")
-    ap.add_argument("--save_video", default="", help="Optional: path to save a scored demo mp4 (requires --demo_video)")
+    ap.add_argument("--topk", type=int, default=5, help="k-NN neighbors for scoring (1=old max-sim)")
+    ap.add_argument("--smooth_sigma", type=float, default=3.0, help="Gaussian smooth sigma. 0=use --smooth window.")
+    ap.add_argument("--min_box_area", type=float, default=400.0, help="Min box area (px^2) to score")
+    ap.add_argument("--feature_mode", choices=["mobilenet", "fpn"], default="mobilenet",
+                    help="Feature extraction: mobilenet (crop+embed) or fpn (YOLO FPN RoI-Align)")
+    ap.add_argument("--demo_video", default="")
+    ap.add_argument("--save_video", default="")
     ap.add_argument("--out_csv", required=True)
     ap.add_argument("--out_json", required=True, help="metrics_full.json output")
     ap.add_argument("--seed", type=int, default=0)
@@ -539,41 +351,38 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    logger = setup_logger(args.log_file if args.log_file.strip() else None)
+    logger = setup_logger(name="score_avenue", log_file=args.log_file if args.log_file.strip() else None)
     set_seed(args.seed, args.deterministic, logger)
 
     device = torch.device(args.device)
     classes = parse_classes(args.classes)
     gt_dir = args.gt_dir.strip() or None
 
-    # Repo dir for git hash
-    repo_dir = str(Path(__file__).resolve().parents[2])  # repo root containing .git
+    repo_dir = str(Path(__file__).resolve().parents[2])
     git_hash = get_git_hash(repo_dir)
 
-    # Load memory bank
     bank, mb_meta = load_memory_bank_npz(args.mb, device=device, fp16=args.fp16)
 
-    # Load models
     if YOLO is None:
         raise RuntimeError(f"Failed to import ultralytics/YOLO. Error: {_ultralytics_import_error}")
     yolo = YOLO(args.yolo)
-    embedder = MobileNetV3SmallEmbedder().to(device)
-    embedder.eval()
-    if args.fp16:
+    embedder = get_embedder(
+        feature_mode=args.feature_mode,
+        yolo_model=yolo if args.feature_mode == "fpn" else None,
+        device=device,
+    )
+    if args.fp16 and args.feature_mode == "mobilenet":
         embedder.half()
 
-    
-
-    # Collect videos via AvenueVideoDataset
     test_dir = Path(args.test_dir)
     if not test_dir.is_dir():
         raise RuntimeError(f"--test_dir is not a directory: {test_dir}")
-    
+
     video_paths = None
     if args.demo_video.strip():
         demo_path = str(Path(args.demo_video).resolve())
         video_paths = [demo_path]
-    
+
     dataset = AvenueVideoDataset(
         video_dir=str(test_dir),
         gt_dir=gt_dir,
@@ -588,18 +397,18 @@ def main() -> None:
         transform=lambda x: x,
         video_paths=video_paths,
     )
-    
+
     if len(dataset) == 0:
         raise RuntimeError(f"No .avi videos found in: {test_dir}")
-    # Output dirs
+
     Path(args.out_csv).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
     if args.save_video.strip():
         Path(args.save_video).parent.mkdir(parents=True, exist_ok=True)
-    # Run benchmark
+
     t_all0 = time.time()
-    logger.info(f"dataset videos={len(dataset.videos)} samples={len(dataset)} frame_stride={args.frame_stride} max_frames={args.max_frames}")
-    
+    logger.info(f"dataset videos={len(dataset.videos)} samples={len(dataset)} frame_stride={args.frame_stride} max_frames={args.max_frames} topk={args.topk} smooth_sigma={args.smooth_sigma}")
+
     per_video: List[VideoResult] = score_dataset(
         dataset=dataset,
         yolo=yolo,
@@ -613,21 +422,34 @@ def main() -> None:
         fp16=bool(args.fp16),
         smooth=args.smooth,
         max_frames=args.max_frames,
+        expand=args.expand,
+        topk=args.topk,
+        smooth_sigma=args.smooth_sigma,
+        min_box_area=args.min_box_area,
         logger=logger,
+        feature_mode=args.feature_mode,
     )
-    
+
     wall_all = time.time() - t_all0
-    # Write CSV (always includes gt 0/1/-1 and ORIGINAL frame_idx)
+
     with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["video", "frame_idx", "score", "score_smooth", "num_dets", "gt"])
         for vr in per_video:
-            for fi, sc, ss, nd, gt in zip(vr.frame_idxs, vr.scores, vr.scores_smooth, vr.num_dets, vr.gt):
+            scores_csv = sanitize_array(vr.scores, f"{vr.video}.scores_csv", logger)
+            scores_s_csv = sanitize_array(vr.scores_smooth, f"{vr.video}.scores_smooth_csv", logger)
+            assert len(scores_csv) == len(scores_s_csv) == len(vr.frame_idxs) == len(vr.num_dets) == len(vr.gt)
+            for fi, sc, ss, nd, gt in zip(vr.frame_idxs, scores_csv, scores_s_csv, vr.num_dets, vr.gt):
                 w.writerow([vr.video, int(fi), float(sc), float(ss), int(nd), int(gt)])
 
-    # Aggregate metrics
-    all_scores = np.concatenate([np.asarray(v.scores, np.float32) for v in per_video], axis=0)
-    all_scores_s = np.concatenate([np.asarray(v.scores_smooth, np.float32) for v in per_video], axis=0)
+    all_scores = sanitize_array(
+        np.concatenate([np.asarray(v.scores, np.float32) for v in per_video], axis=0),
+        "all_scores_raw", logger,
+    )
+    all_scores_s = sanitize_array(
+        np.concatenate([np.asarray(v.scores_smooth, np.float32) for v in per_video], axis=0),
+        "all_scores_smooth", logger,
+    )
     all_gt = np.concatenate([np.asarray(v.gt, np.int32) for v in per_video], axis=0)
 
     valid = all_gt >= 0
@@ -635,20 +457,18 @@ def main() -> None:
     y_raw = all_scores[valid]
     y_smooth = all_scores_s[valid]
 
-    overall_auc_raw, overall_ap_raw = compute_auc_ap(y_true, y_raw)
-    overall_auc_s, overall_ap_s = compute_auc_ap(y_true, y_smooth)
+    overall_auc_raw, overall_ap_raw, _ = compute_auc_ap(y_true, y_raw)
+    overall_auc_s, overall_ap_s, _ = compute_auc_ap(y_true, y_smooth)
 
     frames_processed = int(sum(len(v.scores) for v in per_video))
     proc_fps = float(frames_processed / max(wall_all, 1e-9))
 
-    # latency stats across all processed frames
     all_lat = []
     for v in per_video:
         all_lat.extend(v.latency_ms)
     lat_p50 = percentile(all_lat, 50.0)
     lat_p95 = percentile(all_lat, 95.0)
 
-    # Per-video list for JSON
     per_video_json = []
     for v in per_video:
         per_video_json.append({
@@ -704,7 +524,6 @@ def main() -> None:
     logger.info(json.dumps({"overall": metrics_full["overall"], "runtime": metrics_full["runtime"]}, indent=2))
     logger.info(f"CSV:  {args.out_csv}")
     logger.info(f"JSON: {args.out_json}")
-
 
 
 if __name__ == "__main__":

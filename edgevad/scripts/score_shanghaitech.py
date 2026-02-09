@@ -13,18 +13,15 @@ from __future__ import annotations
 
 import argparse
 import csv
-import datetime as _dt
 import json
+import math
 import logging
-import os
-import random
 import re
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -34,178 +31,101 @@ import torch
 try:
     from ultralytics import YOLO
     import ultralytics
-
     _ultralytics_import_error: Optional[Exception] = None
 except Exception as e:  # pragma: no cover - import guard
     YOLO = None
     ultralytics = None
     _ultralytics_import_error = e
 
-try:
-    import torchvision
-
-    _torchvision_import_error: Optional[Exception] = None
-except Exception as e:  # pragma: no cover - import guard
-    torchvision = None
-    _torchvision_import_error = e
-
-try:
-    from sklearn.metrics import roc_auc_score, average_precision_score
-except Exception:  # pragma: no cover - optional dep
-    roc_auc_score = None
-    average_precision_score = None
-
 from edgevad.data.shanghaitech_dataset import (
+    get_gt_per_frame,
     list_videos,
-    load_shanghaitech_gt,
 )
 
+# Shared core imports
+from edgevad.core import (
+    utc_ts, get_git_hash, setup_logger, env_info,
+    set_seed, percentile,
+    l2_normalize, sanitize_array,
+    compute_auc_ap, validate_metrics_schema,
+    smooth_moving_average, gaussian_smooth,
+    MobileNetV3SmallEmbedder, preprocess_crops_to_tensor, get_embedder,
+    load_memory_bank_npz,
+    parse_classes,
+    extract_scene_id,
+)
+from edgevad.core.memory_bank import score_knn, build_scene_banks
+
 
 # -------------------------
-# Logging / Repro
+# ShanghaiTech-specific helpers
 # -------------------------
 
 
-def utc_ts() -> str:
-    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+def _natural_key(path: Path) -> List[Any]:
+    parts = re.split(r"(\d+)", path.stem)
+    key: List[Any] = []
+    for p in parts:
+        if p.isdigit():
+            key.append(int(p))
+        elif p:
+            key.append(p.lower())
+    return key
 
 
-def get_git_hash(repo_dir: str) -> Optional[str]:
-    try:
-        out = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=repo_dir, stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        if re.fullmatch(r"[0-9a-f]{40}", out):
-            return out
-    except Exception:
-        pass
-    return None
-
-
-def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
+def iter_frames(
+    video_path_or_dir: str, max_frames: int = 0, stride: int = 1
+) -> Iterator[tuple[int, np.ndarray]]:
+    path = Path(video_path_or_dir)
     logger = logging.getLogger("score_shanghaitech")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
 
-    fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
+    if path.is_file():
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {path}")
+        frame_idx = 0
+        yielded = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            if frame_idx % stride == 0:
+                yield frame_idx, frame
+                yielded += 1
+                if max_frames > 0 and yielded >= max_frames:
+                    break
+            frame_idx += 1
+        cap.release()
+        return
 
-    if log_file:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(log_file, mode="w", encoding="utf-8")
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
+    if path.is_dir():
+        image_exts = {".jpg", ".jpeg", ".png"}
+        frames = [
+            p for p in path.iterdir() if p.is_file() and p.suffix.lower() in image_exts
+        ]
+        frames = sorted(frames, key=_natural_key)
+        if not frames:
+            raise FileNotFoundError(f"No frame images found under: {path}")
+        yielded = 0
+        for frame_idx, frame_path in enumerate(frames):
+            if frame_idx % stride != 0:
+                continue
+            frame = cv2.imread(str(frame_path))
+            if frame is None:
+                logger.warning(f"{path.name} frame {frame_idx}: failed to read {frame_path}")
+                continue
+            yield frame_idx, frame
+            yielded += 1
+            if max_frames > 0 and yielded >= max_frames:
+                break
+        return
 
-    logger.propagate = False
-    return logger
-
-
-def set_seed(seed: int, deterministic: bool, logger: logging.Logger) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    if deterministic:
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        try:
-            torch.use_deterministic_algorithms(True)
-        except Exception as e:  # pragma: no cover - older torch
-            logger.warning(f"torch.use_deterministic_algorithms(True) failed: {e}")
-
-
-def percentile(x: List[float], p: float) -> Optional[float]:
-    if not x:
-        return None
-    arr = np.asarray(x, dtype=np.float64)
-    return float(np.percentile(arr, p))
-
-
-# -------------------------
-# Model helpers
-# -------------------------
-
-
-class MobileNetV3SmallEmbedder(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        if torchvision is None:
-            raise RuntimeError(f"Failed to import torchvision. Error: {_torchvision_import_error}")
-        weights = torchvision.models.MobileNet_V3_Small_Weights.DEFAULT
-        m = torchvision.models.mobilenet_v3_small(weights=weights)
-        self.features = m.features
-        self.avgpool = m.avgpool
-        self.out_dim = 576
-
-        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
-        self.register_buffer("_mean", mean, persistent=False)
-        self.register_buffer("_std", std, persistent=False)
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = (x - self._mean) / self._std
-        x = self.features(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        return x
-
-
-def preprocess_crops_to_tensor(crops_bgr: List[np.ndarray], device: torch.device, fp16: bool) -> torch.Tensor:
-    batch = []
-    for c in crops_bgr:
-        if c is None or c.size == 0:
-            continue
-        r = cv2.resize(c, (224, 224), interpolation=cv2.INTER_LINEAR)
-        r = cv2.cvtColor(r, cv2.COLOR_BGR2RGB)
-        t = torch.from_numpy(r).to(torch.float32) / 255.0
-        t = t.permute(2, 0, 1).contiguous()
-        batch.append(t)
-    if not batch:
-        return torch.empty((0, 3, 224, 224), device=device, dtype=torch.float16 if fp16 else torch.float32)
-    x = torch.stack(batch, dim=0).to(device=device)
-    if fp16:
-        x = x.half()
-    return x
-
-
-def l2_normalize(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    return x / (x.norm(dim=1, keepdim=True) + eps)
+    raise FileNotFoundError(f"Path is neither file nor directory: {path}")
 
 
 # -------------------------
-# Metrics helpers
+# Data structures
 # -------------------------
-
-
-def smooth_moving_average(x: np.ndarray, win: int) -> np.ndarray:
-    if win <= 1:
-        return x.copy()
-    win = int(win)
-    kernel = np.ones(win, dtype=np.float32) / float(win)
-    pad = win // 2
-    xp = np.pad(x.astype(np.float32), (pad, pad), mode="reflect")
-    ys = np.convolve(xp, kernel, mode="valid")
-    return ys.astype(np.float32)
-
-
-def compute_auc_ap(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
-    if roc_auc_score is None or average_precision_score is None:
-        return None, None
-    y_true = y_true.astype(np.int32)
-    uniq = np.unique(y_true)
-    if len(uniq) < 2:
-        return None, None
-    try:
-        auc = float(roc_auc_score(y_true, y_score))
-        ap = float(average_precision_score(y_true, y_score))
-        return auc, ap
-    except Exception:
-        return None, None
 
 
 @dataclass
@@ -232,31 +152,6 @@ class VideoResult:
 
 
 # -------------------------
-# GT resolution
-# -------------------------
-
-
-def resolve_gt_path(gt_dir: str, video_path: str) -> Optional[Path]:
-    """
-    Best-effort resolver: looks for files matching the video stem with .npy or .mat.
-    Examples:
-      <gt_dir>/<stem>.npy
-      <gt_dir>/<stem>.mat
-    """
-    if not gt_dir:
-        return None
-    root = Path(gt_dir).expanduser().resolve()
-    if not root.is_dir():
-        raise NotADirectoryError(f"--gt_dir is not a directory: {root}")
-    stem = Path(video_path).stem
-    candidates = [root / f"{stem}.npy", root / f"{stem}.mat"]
-    for c in candidates:
-        if c.is_file():
-            return c
-    return None
-
-
-# -------------------------
 # Main scoring logic
 # -------------------------
 
@@ -266,7 +161,7 @@ def score_videos(
     frame_stride: int,
     max_frames: int,
     yolo: Any,
-    embedder: MobileNetV3SmallEmbedder,
+    embedder: torch.nn.Module,
     bank: torch.Tensor,
     device: torch.device,
     imgsz: int,
@@ -275,43 +170,48 @@ def score_videos(
     max_dets_per_frame: int,
     fp16: bool,
     smooth: int,
+    expand: float,
     gt_dir: Optional[str],
+    topk: int,
+    smooth_sigma: float,
+    min_box_area: float,
     logger: logging.Logger,
+    scene_banks: Optional[Dict[str, torch.Tensor]] = None,
+    feature_mode: str = "mobilenet",
 ) -> List[VideoResult]:
     results: List[VideoResult] = []
 
     for video_path in video_paths:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open video: {video_path}")
+        path = Path(video_path)
+        clip_id = path.stem if path.is_file() else path.name
+
+        # Select effective bank: per-scene or global
+        effective_bank = bank
+        if scene_banks is not None:
+            scene_id = extract_scene_id(clip_id)
+            if scene_id is not None and scene_id in scene_banks:
+                effective_bank = scene_banks[scene_id]
+            else:
+                logger.warning(
+                    f"{clip_id}: scene '{scene_id}' not found in scene_banks, using global bank"
+                )
 
         gt_labels = None
         if gt_dir:
-            gt_path = resolve_gt_path(gt_dir, video_path)
-            if gt_path:
-                try:
-                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    total_frames = total_frames if total_frames > 0 else None
-                    gt_labels = load_shanghaitech_gt(gt_path, total_frames=total_frames)
-                except Exception as e:
-                    logger.warning(f"Failed to load GT for {video_path}: {e}")
-            else:
-                logger.warning(f"No GT file found for {Path(video_path).name} under {gt_dir}")
+            try:
+                gt_labels = get_gt_per_frame(gt_dir, clip_id)
+            except Exception as e:
+                logger.warning(f"Failed to load GT for {clip_id}: {e}")
 
         frames: List[FrameResult] = []
-        frame_idx = 0
+        last_score = 0.5  # neutral fallback for no-detection frames
         t_start = time.time()
 
-        while True:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                break
-            if frame_idx % frame_stride != 0:
-                frame_idx += 1
-                continue
-            if max_frames > 0 and len(frames) >= max_frames:
-                break
-
+        for frame_idx, frame in iter_frames(
+            video_path_or_dir=video_path,
+            max_frames=max_frames,
+            stride=frame_stride,
+        ):
             t0 = time.time()
             preds = yolo.predict(
                 source=frame,
@@ -325,31 +225,58 @@ def score_videos(
             dets = []
             if boxes is not None and len(boxes) > 0:
                 xyxy = boxes.xyxy.detach().cpu().numpy()
-                confs = boxes.conf.detach().cpu().numpy()
-                order = np.argsort(-confs)
+                confs_arr = boxes.conf.detach().cpu().numpy()
+                order = np.argsort(-confs_arr)
                 for j in order[:max_dets_per_frame]:
                     dets.append(tuple(xyxy[j].tolist()))
 
             crops = []
+            filtered_boxes = []
             h, w = frame.shape[:2]
             for (x1, y1, x2, y2) in dets:
-                x1i = max(0, min(w - 1, int(x1)))
-                y1i = max(0, min(h - 1, int(y1)))
-                x2i = max(0, min(w, int(x2)))
-                y2i = max(0, min(h, int(y2)))
+                # Expand box to match build-time expansion
+                cx = 0.5 * (x1 + x2)
+                cy = 0.5 * (y1 + y2)
+                bw = (x2 - x1) * expand
+                bh = (y2 - y1) * expand
+                x1e = cx - 0.5 * bw
+                y1e = cy - 0.5 * bh
+                x2e = cx + 0.5 * bw
+                y2e = cy + 0.5 * bh
+                x1i = max(0, min(w - 1, int(x1e)))
+                y1i = max(0, min(h - 1, int(y1e)))
+                x2i = max(0, min(w, int(x2e)))
+                y2i = max(0, min(h, int(y2e)))
                 if x2i <= x1i or y2i <= y1i:
                     continue
-                crops.append(frame[y1i:y2i, x1i:x2i].copy())
+                area = float((x2i - x1i) * (y2i - y1i))
+                if area < min_box_area:
+                    continue
+                if feature_mode == "mobilenet":
+                    crops.append(frame[y1i:y2i, x1i:x2i].copy())
+                filtered_boxes.append([x1i, y1i, x2i, y2i])
 
-            score = 0.0
-            nd = len(crops)
+            nd = len(filtered_boxes)
             if nd > 0:
-                x = preprocess_crops_to_tensor(crops, device=device, fp16=fp16)
                 with torch.no_grad():
-                    emb = embedder(x)
-                    emb = l2_normalize(emb.to(dtype=bank.dtype))
-                    sim = emb @ bank.T
-                    score = float(1.0 - sim.max().item())
+                    if feature_mode == "fpn":
+                        boxes_xyxy = np.array(filtered_boxes, dtype=np.float64)
+                        emb = embedder(frame, boxes_xyxy, imgsz=imgsz)
+                    else:
+                        x = preprocess_crops_to_tensor(crops, device=device, fp16=fp16)
+                        emb = embedder(x)
+                    emb = l2_normalize(emb.to(dtype=effective_bank.dtype))
+                    per_det_scores = score_knn(emb, effective_bank, topk=topk)
+                    score = float(per_det_scores.max().item())
+            else:
+                # No detections: carry forward last score (avoids false-normal bias)
+                score = last_score
+
+            if not math.isfinite(score):
+                logger.warning(f"{clip_id} frame {frame_idx}: non-finite score -> carry-forward")
+                score = last_score
+
+            last_score = score
 
             label = -1
             if gt_labels is not None and frame_idx < len(gt_labels):
@@ -366,24 +293,29 @@ def score_videos(
                     latency_ms=latency_ms,
                 )
             )
-            frame_idx += 1
-
-        cap.release()
 
         # smoothing and metrics
-        scores_np = np.asarray([f.score for f in frames], dtype=np.float32)
-        scores_smooth = smooth_moving_average(scores_np, smooth)
-        for f, s in zip(frames, scores_smooth):
+        scores_np = sanitize_array(
+            [f.score for f in frames], f"{clip_id}.scores_raw", logger, posinf=1.0
+        )
+        if smooth_sigma > 0:
+            scores_smooth_arr = gaussian_smooth(scores_np, smooth_sigma)
+        else:
+            scores_smooth_arr = smooth_moving_average(scores_np, smooth)
+        scores_smooth_arr = sanitize_array(
+            scores_smooth_arr, f"{clip_id}.scores_smooth", logger, posinf=1.0
+        )
+        for f, s in zip(frames, scores_smooth_arr):
             f.score_smooth = float(s)
 
         gt_np = np.asarray([f.gt for f in frames], dtype=np.int32)
         valid = gt_np >= 0
         y_true = gt_np[valid].astype(np.int32)
         y_raw = scores_np[valid]
-        y_smooth = scores_smooth[valid]
+        y_smooth = scores_smooth_arr[valid]
 
-        auc_raw, ap_raw = compute_auc_ap(y_true, y_raw)
-        auc_s, ap_s = compute_auc_ap(y_true, y_smooth)
+        auc_raw, ap_raw, reason_raw = compute_auc_ap(y_true, y_raw)
+        auc_s, ap_s, reason_s = compute_auc_ap(y_true, y_smooth)
 
         gt_counts = {
             "-1": int((gt_np == -1).sum()),
@@ -396,7 +328,7 @@ def score_videos(
 
         results.append(
             VideoResult(
-                video=Path(video_path).name,
+                video=clip_id,
                 frames=frames,
                 wall_time_s=float(wall),
                 proc_fps=float(proc_fps),
@@ -412,67 +344,6 @@ def score_videos(
 
 
 # -------------------------
-# Memory bank loader / env info
-# -------------------------
-
-
-def load_memory_bank_npz(path: str, device: torch.device, fp16: bool) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    d = np.load(path, allow_pickle=True)
-    if "embeddings" not in d:
-        raise RuntimeError(f"Memory bank npz missing 'embeddings': {path}")
-    E = d["embeddings"]
-    E = E.astype(np.float16 if fp16 else np.float32, copy=False)
-    meta = {}
-    if "config" in d:
-        try:
-            meta["config"] = str(d["config"])
-        except Exception:
-            meta["config"] = None
-    bank = torch.from_numpy(E).to(device=device)
-    bank = l2_normalize(bank)
-    return bank, meta
-
-
-def env_info(device: torch.device) -> Dict[str, Any]:
-    info: Dict[str, Any] = {}
-    info["python"] = sys.version.replace("\n", " ")
-    info["platform"] = os.name
-    info["torch"] = torch.__version__
-    info["torchvision"] = getattr(torchvision, "__version__", None)
-    info["ultralytics"] = getattr(ultralytics, "__version__", None)
-    info["cuda_available"] = bool(torch.cuda.is_available())
-    info["cuda_version"] = getattr(torch.version, "cuda", None)
-    if torch.cuda.is_available() and "cuda" in str(device):
-        try:
-            idx = int(str(device).split(":")[-1])
-        except Exception:
-            idx = 0
-        info["gpu_name"] = torch.cuda.get_device_name(idx)
-    else:
-        info["gpu_name"] = None
-    return info
-
-
-def validate_metrics_schema(metrics: Dict[str, Any]) -> None:
-    required_top = {"timestamp_utc", "git_hash", "args", "env", "memory_bank", "overall", "runtime", "per_video"}
-    missing_top = required_top.difference(metrics.keys())
-    if missing_top:
-        raise ValueError(f"metrics_full missing top-level keys: {sorted(missing_top)}")
-
-    overall = metrics.get("overall", {})
-    for key in ("auc_raw", "auc_smooth", "ap_raw", "ap_smooth"):
-        if key not in overall:
-            raise ValueError(f"metrics_full.overall missing key: {key}")
-
-    runtime = metrics.get("runtime", {})
-    for key in ("wall_seconds", "proc_fps"):
-        if key not in runtime:
-            raise ValueError(f"metrics_full.runtime missing key: {key}")
-    if not isinstance(metrics.get("per_video"), list):
-        raise ValueError("metrics_full.per_video must be a list")
-
-
-# -------------------------
 # CLI
 # -------------------------
 
@@ -481,8 +352,12 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser("Score ShanghaiTech dataset with EdgeVAD")
     ap.add_argument("--yolo", required=True, help="Path to YOLO weights (.pt)")
     ap.add_argument("--mb", required=True, help="Memory bank .npz (embeddings)")
-    ap.add_argument("--test_dir", required=True, help="ShanghaiTech test videos directory")
-    ap.add_argument("--gt_dir", default="", help="Optional GT directory with per-video labels (.npy/.mat)")
+    ap.add_argument("--test_dir", required=True, help="ShanghaiTech testing/frames directory")
+    ap.add_argument(
+        "--gt_dir",
+        default="",
+        help="Optional GT root/testing directory (testing/test_frame_mask and/or testing/test_pixel_mask)",
+    )
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--conf", type=float, default=0.25)
@@ -491,32 +366,37 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max_dets_per_frame", type=int, default=3)
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--smooth", type=int, default=9)
+    ap.add_argument("--expand", type=float, default=1.05, help="Box expansion factor (match build_memory_bank)")
     ap.add_argument("--max_frames", type=int, default=0, help="Max processed frames per video (0 = no limit)")
+    ap.add_argument("--topk", type=int, default=5, help="k-NN neighbors for scoring (1=old max-sim)")
+    ap.add_argument("--smooth_sigma", type=float, default=3.0, help="Gaussian smooth sigma. 0=use --smooth window.")
+    ap.add_argument("--min_box_area", type=float, default=400.0, help="Min box area (px^2) to score")
     ap.add_argument("--out_csv", required=True)
     ap.add_argument("--out_json", required=True, help="metrics_full.json output")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--deterministic", action="store_true")
     ap.add_argument("--log_file", default="", help="Optional log file path")
+    ap.add_argument(
+        "--per_scene",
+        action="store_true",
+        help="Use per-scene memory banks (requires bank built with --per_scene).",
+    )
+    ap.add_argument(
+        "--feature_mode",
+        choices=["mobilenet", "fpn"],
+        default="mobilenet",
+        help="Feature extraction: mobilenet (crop+embed) or fpn (YOLO FPN RoI-Align)",
+    )
     return ap.parse_args()
-
-
-def parse_classes(s: str) -> Optional[List[int]]:
-    s = str(s).strip()
-    if s == "" or s.lower() in {"none", "null"}:
-        return None
-    parts = [p.strip() for p in s.split(",")]
-    out = []
-    for p in parts:
-        if p == "":
-            continue
-        out.append(int(p))
-    return out if out else None
 
 
 def main() -> None:
     args = parse_args()
 
-    logger = setup_logger(args.log_file if args.log_file.strip() else None)
+    logger = setup_logger(
+        name="score_shanghaitech",
+        log_file=args.log_file if args.log_file.strip() else None,
+    )
     set_seed(args.seed, args.deterministic, logger)
 
     device = torch.device(args.device)
@@ -532,24 +412,42 @@ def main() -> None:
 
     video_paths = list_videos(str(test_dir), ext=".avi")
     if len(video_paths) == 0:
-        raise RuntimeError(f"No .avi videos found in: {test_dir}")
+        raise RuntimeError(f"No test videos or frame directories found in: {test_dir}")
 
     Path(args.out_csv).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
 
     bank, mb_meta = load_memory_bank_npz(args.mb, device=device, fp16=args.fp16)
 
+    scene_banks: Optional[Dict[str, torch.Tensor]] = None
+    if args.per_scene:
+        if "scene_ids" not in mb_meta:
+            raise RuntimeError(
+                "--per_scene requires a memory bank built with --per_scene "
+                "(must contain scene_ids). Rebuild with: build_memory_bank.py --per_scene"
+            )
+        scene_banks = build_scene_banks(bank, mb_meta["scene_ids"])
+        logger.info(
+            f"Per-scene banks: {len(scene_banks)} scenes, "
+            + ", ".join(f"{k}={v.shape[0]}" for k, v in sorted(scene_banks.items()))
+        )
+
     if YOLO is None:
         raise RuntimeError(f"Failed to import ultralytics/YOLO. Error: {_ultralytics_import_error}")
     yolo = YOLO(args.yolo)
-    embedder = MobileNetV3SmallEmbedder().to(device)
-    embedder.eval()
-    if args.fp16:
+    embedder = get_embedder(
+        feature_mode=args.feature_mode,
+        yolo_model=yolo if args.feature_mode == "fpn" else None,
+        device=device,
+    )
+    if args.fp16 and args.feature_mode == "mobilenet":
         embedder.half()
 
     t_all0 = time.time()
     logger.info(
-        f"dataset videos={len(video_paths)} frame_stride={args.frame_stride} max_frames={args.max_frames} imgsz={args.imgsz}"
+        f"dataset items={len(video_paths)} frame_stride={args.frame_stride} "
+        f"max_frames={args.max_frames} imgsz={args.imgsz} topk={args.topk} "
+        f"smooth_sigma={args.smooth_sigma} min_box_area={args.min_box_area}"
     )
 
     per_video = score_videos(
@@ -566,8 +464,14 @@ def main() -> None:
         max_dets_per_frame=args.max_dets_per_frame,
         fp16=bool(args.fp16),
         smooth=args.smooth,
+        expand=args.expand,
         gt_dir=gt_dir,
+        topk=args.topk,
+        smooth_sigma=args.smooth_sigma,
+        min_box_area=args.min_box_area,
         logger=logger,
+        scene_banks=scene_banks,
+        feature_mode=args.feature_mode,
     )
 
     wall_all = time.time() - t_all0
@@ -577,12 +481,30 @@ def main() -> None:
         w = csv.writer(f)
         w.writerow(["video", "frame_idx", "score", "score_smooth", "num_dets", "gt"])
         for vr in per_video:
-            for fr in vr.frames:
-                w.writerow([vr.video, fr.frame_idx, fr.score, fr.score_smooth, fr.num_dets, fr.gt])
+            scores_csv = sanitize_array(
+                [fr.score for fr in vr.frames], f"{vr.video}.scores_csv", logger, posinf=1.0
+            )
+            scores_s_csv = sanitize_array(
+                [fr.score_smooth for fr in vr.frames],
+                f"{vr.video}.scores_smooth_csv",
+                logger,
+                posinf=1.0,
+            )
+            assert len(scores_csv) == len(scores_s_csv) == len(vr.frames)
+            for fr, sc, ss in zip(vr.frames, scores_csv, scores_s_csv):
+                w.writerow([vr.video, fr.frame_idx, float(sc), float(ss), fr.num_dets, fr.gt])
 
-    all_scores = np.concatenate([np.asarray([fr.score for fr in v.frames], np.float32) for v in per_video], axis=0)
-    all_scores_s = np.concatenate(
-        [np.asarray([fr.score_smooth for fr in v.frames], np.float32) for v in per_video], axis=0
+    all_scores = sanitize_array(
+        np.concatenate([np.asarray([fr.score for fr in v.frames], np.float32) for v in per_video], axis=0),
+        "all_scores_raw",
+        logger,
+        posinf=1.0,
+    )
+    all_scores_s = sanitize_array(
+        np.concatenate([np.asarray([fr.score_smooth for fr in v.frames], np.float32) for v in per_video], axis=0),
+        "all_scores_smooth",
+        logger,
+        posinf=1.0,
     )
     all_gt = np.concatenate([np.asarray([fr.gt for fr in v.frames], np.int32) for v in per_video], axis=0)
 
@@ -591,8 +513,8 @@ def main() -> None:
     y_raw = all_scores[valid]
     y_smooth = all_scores_s[valid]
 
-    overall_auc_raw, overall_ap_raw = compute_auc_ap(y_true, y_raw)
-    overall_auc_s, overall_ap_s = compute_auc_ap(y_true, y_smooth)
+    overall_auc_raw, overall_ap_raw, overall_reason_raw = compute_auc_ap(y_true, y_raw)
+    overall_auc_s, overall_ap_s, overall_reason_s = compute_auc_ap(y_true, y_smooth)
 
     frames_processed = int(sum(len(v.frames) for v in per_video))
     proc_fps = float(frames_processed / max(wall_all, 1e-9))
@@ -605,6 +527,20 @@ def main() -> None:
 
     per_video_json = []
     for v in per_video:
+        gt_np = np.asarray([fr.gt for fr in v.frames], np.int32)
+        valid_v = gt_np >= 0
+        y_true_v = gt_np[valid_v].astype(np.int32)
+        y_raw_v = sanitize_array(
+            [fr.score for fr in v.frames], f"{v.video}.scores_raw_metrics", logger, posinf=1.0
+        )[valid_v]
+        y_smooth_v = sanitize_array(
+            [fr.score_smooth for fr in v.frames],
+            f"{v.video}.scores_smooth_metrics",
+            logger,
+            posinf=1.0,
+        )[valid_v]
+        auc_raw_v, ap_raw_v, reason_raw_v = compute_auc_ap(y_true_v, y_raw_v)
+        auc_s_v, ap_s_v, reason_s_v = compute_auc_ap(y_true_v, y_smooth_v)
         per_video_json.append(
             {
                 "video": v.video,
@@ -614,10 +550,14 @@ def main() -> None:
                 "proc_fps": v.proc_fps,
                 "latency_ms_p50": percentile([fr.latency_ms for fr in v.frames], 50.0),
                 "latency_ms_p95": percentile([fr.latency_ms for fr in v.frames], 95.0),
-                "auc_raw": v.auc_raw,
-                "ap_raw": v.ap_raw,
-                "auc_smooth": v.auc_smooth,
-                "ap_smooth": v.ap_smooth,
+                "auc_raw": auc_raw_v,
+                "ap_raw": ap_raw_v,
+                "auc_smooth": auc_s_v,
+                "ap_smooth": ap_s_v,
+                "auc_raw_reason": reason_raw_v,
+                "ap_raw_reason": reason_raw_v,
+                "auc_smooth_reason": reason_s_v,
+                "ap_smooth_reason": reason_s_v,
                 "gt_counts": v.gt_counts,
             }
         )
@@ -632,12 +572,22 @@ def main() -> None:
             "shape": [int(bank.shape[0]), int(bank.shape[1])],
             "dtype": str(bank.dtype),
             "meta": mb_meta,
+            "per_scene": scene_banks is not None,
+            "scene_bank_sizes": (
+                {k: int(v.shape[0]) for k, v in sorted(scene_banks.items())}
+                if scene_banks is not None
+                else None
+            ),
         },
         "overall": {
             "auc_raw": overall_auc_raw,
             "auc_smooth": overall_auc_s,
             "ap_raw": overall_ap_raw,
             "ap_smooth": overall_ap_s,
+            "auc_raw_reason": overall_reason_raw,
+            "ap_raw_reason": overall_reason_raw,
+            "auc_smooth_reason": overall_reason_s,
+            "ap_smooth_reason": overall_reason_s,
         },
         "runtime": {
             "num_videos": len(per_video),

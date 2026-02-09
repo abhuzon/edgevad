@@ -351,7 +351,15 @@ class AvenueVideoDataset(Dataset):
         if ok and frame_out is not None and current == frame_idx:
             return frame_out
 
-        raise RuntimeError(f"Could not read frame {frame_idx} from {video_path}")
+        # Corrupted frame: log warning and return black dummy frame to continue processing
+        import logging
+        logger = logging.getLogger("avenue_dataset")
+        logger.warning(
+            f"Could not read frame {frame_idx} from {video_path} (corrupted). "
+            "Returning black dummy frame to skip."
+        )
+        # Return a dummy black frame (typical video resolution)
+        return np.zeros((480, 640, 3), dtype=np.uint8)
 
     def _count_frames(self, video_path: str) -> int:
         cap = cv2.VideoCapture(video_path)
